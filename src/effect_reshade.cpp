@@ -1118,57 +1118,122 @@ namespace vkBasalt
 
     void ReshadeEffect::createReshadeModule()
     {
-        std::string tempFile  = "/tmp/vkBasalt.spv";
-        std::string tempFile2 = "/tmp/vkBasalt.spv";
+        if (!pLogicalDevice || !pConfig) {
+            Logger::err("Invalid device or config");
+            return;
+        }
+
+        char bufferStr[64];
 
         reshadefx::preprocessor preprocessor;
-        preprocessor.add_macro_definition("__RESHADE__", std::to_string(INT_MAX));
+
+        snprintf(bufferStr, sizeof(bufferStr), "%d", INT_MAX);
+        preprocessor.add_macro_definition("__RESHADE__", bufferStr);
         preprocessor.add_macro_definition("__RESHADE_PERFORMANCE_MODE__", "1");
         preprocessor.add_macro_definition("__RENDERER__", "0x20000");
         // TODO add more macros
 
-        preprocessor.add_macro_definition("BUFFER_WIDTH", std::to_string(imageExtent.width));
-        preprocessor.add_macro_definition("BUFFER_HEIGHT", std::to_string(imageExtent.height));
-        preprocessor.add_macro_definition("BUFFER_RCP_WIDTH", "(1.0 / BUFFER_WIDTH)");
-        preprocessor.add_macro_definition("BUFFER_RCP_HEIGHT", "(1.0 / BUFFER_HEIGHT)");
-        preprocessor.add_macro_definition("BUFFER_COLOR_DEPTH", (inputOutputFormatUNORM == VK_FORMAT_A2R10G10B10_UNORM_PACK32) ? "10" : "8");
-        preprocessor.add_include_path(pConfig->getOption<std::string>("reshadeIncludePath"));
-        if (!preprocessor.append_file(pConfig->getOption<std::string>(effectName)))
-        {
-            Logger::err("failed to load shader file: " + pConfig->getOption<std::string>(effectName));
+        // Validate image extent dimensions
+        if (imageExtent.width == 0 || imageExtent.height == 0 || 
+            imageExtent.width > 16384 || imageExtent.height > 16384) {
+            Logger::err("Invalid image dimensions");
+            return;
+        }
+
+         // Use stack buffer for number conversions
+        snprintf(bufferStr, sizeof(bufferStr), "%u", imageExtent.width);
+        preprocessor.add_macro_definition("BUFFER_WIDTH", bufferStr);
+        
+        snprintf(bufferStr, sizeof(bufferStr), "%u", imageExtent.height);
+        preprocessor.add_macro_definition("BUFFER_HEIGHT", bufferStr);
+
+        // Pre-calculate reciprocal values
+        const float rcpWidth = 1.0f / static_cast<float>(imageExtent.width);
+        const float rcpHeight = 1.0f / static_cast<float>(imageExtent.height);
+
+        snprintf(bufferStr, sizeof(bufferStr), "%.9g", rcpWidth);
+        preprocessor.add_macro_definition("BUFFER_RCP_WIDTH", bufferStr);
+        
+        snprintf(bufferStr, sizeof(bufferStr), "%.9g", rcpHeight);
+        preprocessor.add_macro_definition("BUFFER_RCP_HEIGHT", bufferStr);
+        
+        preprocessor.add_macro_definition("BUFFER_COLOR_DEPTH", 
+            (inputOutputFormatUNORM == VK_FORMAT_A2R10G10B10_UNORM_PACK32) ? "10" : "8");
+
+        const std::string& includePath = pConfig->getOption<std::string>("reshadeIncludePath");
+        if (includePath.empty()) {
+            Logger::err("Empty include path");
+            return;
+        }
+        preprocessor.add_include_path(includePath);
+
+        // Get effect name once
+        const std::string& effect = pConfig->getOption<std::string>(effectName);
+        if (effect.empty()) {
+            Logger::err("Empty effect name");
+            return;
+        }
+
+        if (!preprocessor.append_file(effect)) {
+            Logger::err("Failed to load shader file: " + effect);
             Logger::err("Does the filepath exist and does it not include spaces?");
+            return;
+        }
+
+        // Check for preprocessor errors early
+        std::string errors = preprocessor.errors();
+        if (!errors.empty()) {
+            Logger::err(errors);
+            return;
         }
 
         reshadefx::parser parser;
-
-        std::string errors = preprocessor.errors();
-        if (errors != "")
-        {
-            Logger::err(errors);
+        
+        // Move preprocessor output directly to parser
+        std::unique_ptr<reshadefx::codegen> codegen(reshadefx::create_codegen_spirv(
+            true, true, true, true));
+        if (!codegen) {
+            Logger::err("Failed to create codegen");
+            return;
         }
 
-        std::unique_ptr<reshadefx::codegen> codegen(reshadefx::create_codegen_spirv(
-            true /* vulkan semantics */, true /* debug info */, true /* uniforms to spec constants */, true /*flip vertex shader*/));
         parser.parse(std::move(preprocessor.output()), codegen.get());
 
         errors = parser.errors();
-        if (errors != "")
-        {
+        if (!errors.empty()) {
             Logger::err(errors);
+            return;
         }
+
         codegen->write_result(module);
 
-        VkShaderModuleCreateInfo shaderCreateInfo;
-        shaderCreateInfo.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-        shaderCreateInfo.pNext    = nullptr;
-        shaderCreateInfo.flags    = 0;
-        shaderCreateInfo.codeSize = module.spirv.size() * sizeof(uint32_t);
-        shaderCreateInfo.pCode    = module.spirv.data();
+        // Validate SPIR-V size
+        if (module.spirv.empty() || module.spirv.size() > 1048576) { // 1MB limit
+            Logger::err("Invalid SPIR-V size");
+            return;
+        }
 
-        VkResult result = pLogicalDevice->vkd.CreateShaderModule(pLogicalDevice->device, &shaderCreateInfo, nullptr, &shaderModule);
-        ASSERT_VULKAN(result);
+        const VkShaderModuleCreateInfo shaderCreateInfo{
+            .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .codeSize = module.spirv.size() * sizeof(uint32_t),
+            .pCode = module.spirv.data()
+        };
 
-        Logger::debug("created reshade shaderModule");
+        VkResult result = pLogicalDevice->vkd.CreateShaderModule(
+            pLogicalDevice->device, 
+            &shaderCreateInfo, 
+            nullptr, 
+            &shaderModule
+        );
+
+        if (result != VK_SUCCESS) {
+            Logger::err("Failed to create shader module: " + std::to_string(result));
+            return;
+        }
+
+        Logger::debug("Created reshade shaderModule");
     }
 
     VkFormat ReshadeEffect::convertReshadeFormat(reshadefx::texture_format texFormat)

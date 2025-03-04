@@ -1,174 +1,185 @@
 #include "config.hpp"
 #include "config_paths.hpp"
-
-#include <sstream>
-#include <locale>
+#include <array>
+#include <cstring>
+#include <cstdint>
 
 namespace vkBasalt
 {
-    Config::Config()
+    Config::Config() noexcept
     {
-        // Custom config file path
-        const char* tmpConfEnv       = std::getenv("VKBASALT_CONFIG_FILE");
-        std::string customConfigFile = tmpConfEnv ? std::string(tmpConfEnv) : "";
-
-        // User config file path
-        const char* tmpHomeEnv     = std::getenv("XDG_DATA_HOME");
-        std::string userConfigFile = tmpHomeEnv ? std::string(tmpHomeEnv) + "/vkBasalt/vkBasalt.conf"
-                                                : std::string(std::getenv("HOME")) + "/.local/share/vkBasalt/vkBasalt.conf";
-
-        const char* tmpConfigEnv      = std::getenv("XDG_CONFIG_HOME");
-        std::string userXdgConfigFile = tmpConfigEnv ? std::string(tmpConfigEnv) + "/vkBasalt/vkBasalt.conf"
-                                                     : std::string(std::getenv("HOME")) + "/.config/vkBasalt/vkBasalt.conf";
-
-        // Allowed config paths
-        const std::array<std::string, 7> configPath = {
-            customConfigFile,                                    // custom config (VKBASALT_CONFIG_FILE=/path/to/vkBasalt.conf)
-            "vkBasalt.conf",                                     // per game config
-            userXdgConfigFile,                                   // user-global config
-            userConfigFile,                                      // legacy default config
-            std::string(SYSCONFDIR) + "/vkBasalt.conf",          // system-wide config
-            std::string(SYSCONFDIR) + "/vkBasalt/vkBasalt.conf", // system-wide config (alternative)
-            std::string(DATADIR) + "/vkBasalt/vkBasalt.conf",    // legacy system-wide config
+        const char* const configPaths[] = {
+            std::getenv("VKBASALT_CONFIG_FILE"),
+            "vkBasalt.conf",
+            std::getenv("XDG_CONFIG_HOME"),
+            std::getenv("XDG_DATA_HOME"),
+            std::getenv("HOME"),
+            SYSCONFDIR "/vkBasalt.conf",
+            SYSCONFDIR "/vkBasalt/vkBasalt.conf",
+            DATADIR "/vkBasalt/vkBasalt.conf"
         };
 
-        for (const auto& cFile : configPath)
-        {
-            std::ifstream configFile(cFile);
-            if (!configFile.good())
-                continue;
+        std::array<char, 512> pathBuffer{};
+        
+        // Try custom config first
+        if (configPaths[0]) {
+            std::ifstream configFile(configPaths[0]);
+            if (configFile.good()) {
+                //Logger::info("config file: " + std::string(configPaths[0]));
+                readConfigFile(configFile);
+                return;
+            }
+        }
 
-            Logger::info("config file: " + cFile);
+        // Try XDG config paths
+        if (configPaths[2]) {
+            std::snprintf(pathBuffer.data(), pathBuffer.size(), "%s/vkBasalt/vkBasalt.conf", configPaths[2]);
+            std::ifstream configFile(pathBuffer.data());
+            if (configFile.good()) {
+                //Logger::info("config file: " + std::string(pathBuffer.data()));
+                readConfigFile(configFile);
+                return;
+            }
+        }
+
+        // Try XDG data home
+        if (configPaths[3]) {
+            std::snprintf(pathBuffer.data(), pathBuffer.size(), "%s/vkBasalt/vkBasalt.conf", configPaths[3]);
+        } else if (configPaths[4]) {
+            std::snprintf(pathBuffer.data(), pathBuffer.size(), "%s/.local/share/vkBasalt/vkBasalt.conf", configPaths[4]);
+        }
+        
+        std::ifstream configFile(pathBuffer.data());
+        if (configFile.good()) {
+            //Logger::info("config file: " + std::string(pathBuffer.data()));
             readConfigFile(configFile);
             return;
         }
 
-        Logger::err("no good config file");
+        // Try system paths
+        for (size_t i = 5; i < 8; ++i) {
+            std::ifstream sysConfigFile(configPaths[i]);
+            if (sysConfigFile.good()) {
+                //Logger::info("config file: " + std::string(configPaths[i]));
+                readConfigFile(sysConfigFile);
+                return;
+            }
+        }
+
+        //Logger::err("no good config file");
     }
 
-    Config::Config(const Config& other)
-    {
-        this->options = other.options;
-    }
-
-    void Config::readConfigFile(std::ifstream& stream)
+    void Config::readConfigFile(std::ifstream& stream) noexcept
     {
         std::string line;
+        line.reserve(256); // Reasonable line size
 
         while (std::getline(stream, line))
         {
-            readConfigLine(line);
+            if (!line.empty()) {
+                readConfigLine(line);
+            }
         }
     }
 
-    void Config::readConfigLine(std::string line)
+    void Config::readConfigLine(std::string line) noexcept
     {
+        if (line.empty() || line[0] == '#') return;
+
         std::string key;
         std::string value;
+        key.reserve(32);
+        value.reserve(128);
 
-        bool inQuotes    = false;
-        bool foundEquals = false;
+        size_t pos = 0;
+        const size_t len = line.length();
 
-        auto appendChar = [&key, &value, &foundEquals](const char& newChar) {
-            if (foundEquals)
-                value += newChar;
-            else
-                key += newChar;
-        };
+        // Skip leading whitespace
+        while (pos < len && (line[pos] == ' ' || line[pos] == '\t')) pos++;
+        
+        // Read key
+        while (pos < len && line[pos] != '=' && line[pos] != ' ' && line[pos] != '\t') {
+            key += line[pos++];
+        }
 
-        for (const char& nextChar : line)
-        {
-            if (inQuotes)
-            {
-                if (nextChar == '"')
-                    inQuotes = false;
-                else
-                    appendChar(nextChar);
+        // Find equals sign
+        while (pos < len && line[pos] != '=') pos++;
+        if (pos >= len) return;
+        pos++; // Skip equals
+
+        // Skip whitespace after equals
+        while (pos < len && (line[pos] == ' ' || line[pos] == '\t')) pos++;
+
+        // Read value
+        bool inQuotes = false;
+        for (; pos < len; pos++) {
+            char c = line[pos];
+            if (c == '"') {
+                inQuotes = !inQuotes;
                 continue;
             }
-            switch (nextChar)
-            {
-                case '#': goto BREAK;
-                case '"': inQuotes = true; break;
-                case '\t':
-                case ' ': break;
-                case '=': foundEquals = true; break;
-                default: appendChar(nextChar); break;
+            if (!inQuotes && c == '#') break;
+            if (!inQuotes && (c == ' ' || c == '\t')) {
+                if (value.empty() || value.back() != ' ') value += ' ';
+            } else {
+                value += c;
             }
         }
 
-    BREAK:
+        // Trim trailing whitespace from value
+        while (!value.empty() && value.back() == ' ') {
+            value.pop_back();
+        }
 
-        if (!key.empty() && !value.empty())
-        {
-            Logger::info(key + " = " + value);
-            options[key] = value;
+        if (!key.empty() && !value.empty()) {
+            options[key] = std::move(value);
         }
     }
 
-    void Config::parseOption(const std::string& option, int32_t& result)
+    void Config::parseOption(const std::string& option, int32_t& result) noexcept
     {
         auto found = options.find(option);
-        if (found != options.end())
-        {
-            try
-            {
-                result = std::stoi(found->second);
-            }
-            catch (...)
-            {
-                Logger::warn("invalid int32_t value for: " + option);
+        if (found != options.end()) {
+            char* end;
+            long val = std::strtol(found->second.c_str(), &end, 10);
+            if (*end == '\0' && val >= INT32_MIN && val <= INT32_MAX) {
+                result = static_cast<int32_t>(val);
+            } else {
+                //Logger::warn("invalid int32_t value for: " + option);
             }
         }
     }
 
-    void Config::parseOption(const std::string& option, float& result)
+    void Config::parseOption(const std::string& option, float& result) noexcept
     {
         auto found = options.find(option);
-        if (found != options.end())
-        {
-            // TODO find a better float parsing way, std::stof has locale issues
-            std::stringstream ss(found->second);
-            ss.imbue(std::locale("C"));
-            float value;
-            ss >> value;
-
-            bool failed = ss.fail();
-
-            std::string rest;
-            ss >> rest;
-            if (failed || (!rest.empty() && rest != "f"))
-            {
-                Logger::warn("invalid float value for: " + option);
-            }
-            else
-            {
-                result = value;
+        if (found != options.end()) {
+            char* end;
+            float val = std::strtof(found->second.c_str(), &end);
+            if (*end == '\0' || (*end == 'f' && end[1] == '\0')) {
+                result = val;
+            } else {
+                //Logger::warn("invalid float value for: " + option);
             }
         }
     }
 
-    void Config::parseOption(const std::string& option, bool& result)
+    void Config::parseOption(const std::string& option, bool& result) noexcept
     {
         auto found = options.find(option);
-        if (found != options.end())
-        {
-            if (found->second == "True" || found->second == "true" || found->second == "1")
-            {
+        if (found != options.end()) {
+            const std::string& val = found->second;
+            if (val == "1" || val == "true" || val == "True") {
                 result = true;
-            }
-            else if (found->second == "False" || found->second == "false" || found->second == "0")
-            {
+            } else if (val == "0" || val == "false" || val == "False") {
                 result = false;
-            }
-            else
-            {
-                Logger::warn("invalid bool value for: " + option);
+            } else {
+                //Logger::warn("invalid bool value for: " + option);
             }
         }
     }
 
-    void Config::parseOption(const std::string& option, std::string& result)
+    void Config::parseOption(const std::string& option, std::string& result) noexcept
     {
         auto found = options.find(option);
         if (found != options.end())
@@ -177,18 +188,59 @@ namespace vkBasalt
         }
     }
 
-    void Config::parseOption(const std::string& option, std::vector<std::string>& result)
+    void Config::parseOption(const std::string& option, std::vector<std::string>& result) noexcept
     {
         auto found = options.find(option);
-        if (found != options.end())
+        if (found == options.end())
         {
-            result = {};
-            std::stringstream stringStream(found->second);
-            std::string       newString;
-            while (getline(stringStream, newString, ':'))
+            return;
+        }
+
+        const std::string& value = found->second;
+        size_t start = value.find('{');
+        size_t end = value.find('}');
+
+        if (start == std::string::npos || end == std::string::npos || start >= end)
+        {
+            return;
+        }
+
+        result.clear();
+        result.reserve(8);
+
+        size_t pos = start + 1;
+        while (pos < end)
+        {
+            // Skip whitespace
+            while (pos < end && (value[pos] == ' ' || value[pos] == '\n' || 
+                   value[pos] == '\t' || value[pos] == '\r'))
             {
-                result.push_back(newString);
+                ++pos;
             }
+
+            if (pos >= end) break;
+
+            size_t nextComma = value.find(',', pos);
+            if (nextComma == std::string::npos || nextComma > end)
+            {
+                nextComma = end;
+            }
+
+            // Find effect name end
+            size_t effectEnd = nextComma;
+            while (effectEnd > pos && (value[effectEnd-1] == ' ' || 
+                   value[effectEnd-1] == '\n' || value[effectEnd-1] == '\t' || 
+                   value[effectEnd-1] == '\r'))
+            {
+                --effectEnd;
+            }
+
+            if (effectEnd > pos)
+            {
+                result.emplace_back(value.substr(pos, effectEnd - pos));
+            }
+
+            pos = nextComma + 1;
         }
     }
 } // namespace vkBasalt
